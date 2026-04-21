@@ -5,9 +5,10 @@ import numpy as np
 import pandas as pd
 import os
 import traceback
+import sys
 
 NUM_DAYS = 15
-DBT_PROJECT_DIR = "C:/Jai/SOH_Mobility"
+DBT_PROJECT_DIR = "C:/EOL/SOH/Flexi.SOH_Mobility"
 DB_FILE = "dev.duckdb"
 
 SOC_START_THRESHOLD   = 30.0
@@ -24,7 +25,28 @@ IMBALANCE_TABLE_AH = [0, 0.18, 0.32, 0.46, 0.56, 0.66, 0.80, 1.02, 1.34, 1.84, 2
 VREF_IMBALANCE     = 3.58
 SOH_INITIAL        = 1.0
 
-# def _get_pack_version(con, device_id):
+def _get_current_version(con, device_id):
+    result = con.execute("""
+        SELECT model_version 
+        FROM pack_capacity_measurements 
+        WHERE device_id = ? 
+        ORDER BY event_date DESC 
+        LIMIT 1
+    """, [device_id]).fetchone()
+    
+    if result and result[0]:
+        return str(result[0])
+    
+    return f"V1_{device_id}"
+
+
+def _get_next_version(current_version, device_id):
+    if current_version.startswith("V") and "_" in current_version:
+        parts = current_version.split("_", 1)
+        version_num = int(parts[0][1:])  
+        return f"V{version_num + 1}_{device_id}"
+    
+    return f"V1_{device_id}"
 
 
 def _get_next_capacity_id(con):
@@ -45,12 +67,19 @@ def load_ocv_table(con):
     return df["ocv_voltage"].to_numpy(), df["soc_percent"].to_numpy()
 
 def parse_args():
-    date_input = input("Enter start date (YYYY-MM-DD): ").strip()
-    try:
-        return datetime.strptime(date_input, "%Y-%m-%d")
-    except ValueError:
-        print("Invalid date format. Use YYYY-MM-DD.")
-        exit(1)
+    if len(sys.argv) > 1:
+        try:
+            return datetime.strptime(sys.argv[1], "%Y-%m-%d")
+        except ValueError:
+            print("Invalid date format. Use YYYY-MM-DD.")
+            exit(1)
+    else:
+        date_input = input("Enter start date (YYYY-MM-DD): ").strip()
+        try:
+            return datetime.strptime(date_input, "%Y-%m-%d")
+        except ValueError:
+            print("Invalid date format. Use YYYY-MM-DD.")
+            exit(1)
 
 def get_preceding_idle(seg, segments, idx):
 
@@ -172,8 +201,10 @@ def detect_and_estimate_capacity(con, start_date, end_date, ocv_voltages, ocv_so
         device_soh     = latest_soh.get(device_id, 1.0)
         device_act_cap = actual_capacity.get(device_id, None)
         is_new_device  = device_act_cap is None
+        
+        current_version = _get_current_version(con, device_id)
 
-        print(f"\n[DEVICE] {device_id} | {'NEW' if is_new_device else 'KNOWN'} | SOH: {device_soh:.4f} | ActualCap: {device_act_cap}")
+        print(f"\n[DEVICE] {device_id} | {'NEW' if is_new_device else 'KNOWN'} | SOH: {device_soh:.4f} | ActualCap: {device_act_cap} | Version: {current_version}")
 
         group["seg_type"] = group["current"].apply(
             lambda c: "idle" if float(c) == 0.0 else ("charge" if float(c) >= MIN_CHARGE_CURRENT else "other")
@@ -287,7 +318,7 @@ def detect_and_estimate_capacity(con, start_date, end_date, ocv_voltages, ocv_so
                 str(charge_segment.iloc[-3]["ts"]),
                 ocv_voltage, start_soc_ocv, actual_end_soc, leftover_ah,
                 coulombs_counted, imbalance_ah, total_q_ah,
-                avg_temp, model_version,
+                avg_temp, current_version, 
                 device_act_cap if not is_new_device else None,
                 device_soh
             ])
@@ -304,8 +335,10 @@ def detect_and_estimate_capacity(con, start_date, end_date, ocv_voltages, ocv_so
             nominal         = events[0][1]
             weights         = [e[2] for e in events]
             prior_soh_value = latest_soh.get(device_id, None)
+            
+            current_version = _get_current_version(con, device_id)
 
-            print(f"\n[SOH UPDATE] {device_id} | Events this run: {len(events)} | Prior SOH: {prior_soh_value}")
+            print(f"\n[SOH UPDATE] {device_id} | Events this run: {len(events)} | Prior SOH: {prior_soh_value} | Current Version: {current_version}")
 
             act_cap_row = con.execute("""
                 SELECT actual_capacity FROM pack_capacity_measurements
@@ -325,6 +358,9 @@ def detect_and_estimate_capacity(con, start_date, end_date, ocv_voltages, ocv_so
                     UPDATE pack_capacity_measurements SET actual_capacity = ? WHERE device_id = ?
                 """, [dev_actual_cap, device_id])
                 new_soh = 1.0
+                
+                final_version = current_version
+                print(f"[VERSION] {device_id} | First calculation → {final_version} | SOH: {new_soh:.6f}")
 
             else:
                 if act_cap_row is None or act_cap_row[0] is None:
@@ -346,16 +382,25 @@ def detect_and_estimate_capacity(con, start_date, end_date, ocv_voltages, ocv_so
                 weighted_q = sum(q * w for q, w in zip(qs, weights)) / sum(weights)
                 new_soh    = round(max(weighted_q / dev_actual_cap, 0.0), 6)
                 new_soh    = min(new_soh, prior_soh_value)
-                print(f"[KNOWN DEVICE] {device_id} | WeightedQ: {weighted_q:.4f}Ah | BaselineCap: {dev_actual_cap:.4f}Ah | NewSOH: {new_soh:.6f}")
+                
+                soh_changed = abs(new_soh - prior_soh_value) > 1e-6
+                
+                if soh_changed:
+                    final_version = _get_next_version(current_version, device_id)
+                    print(f"[KNOWN DEVICE] {device_id} | WeightedQ: {weighted_q:.4f}Ah | BaselineCap: {dev_actual_cap:.4f}Ah | NewSOH: {new_soh:.6f}")
+                    print(f"[VERSION] {device_id} | SOH changed {prior_soh_value:.6f} → {new_soh:.6f} | {current_version} → {final_version}")
+                else:
+                    final_version = current_version
+                    print(f"[VERSION] {device_id} | SOH unchanged {new_soh:.6f} | Stays at {final_version}")
 
             con.execute("""
                 UPDATE pack_capacity_measurements
-                SET actual_capacity = ?, soh = ?
+                SET actual_capacity = ?, soh = ?, model_version = ?
                 WHERE device_id = ?
                   AND event_date >= ?::date AND event_date < ?::date
-            """, [dev_actual_cap, new_soh, device_id, start_date, end_date])
+            """, [dev_actual_cap, new_soh, final_version, device_id, start_date, end_date])
 
-            print(f"[WRITTEN] {device_id} | actual_capacity: {dev_actual_cap:.4f}Ah | soh: {new_soh:.6f}")
+            print(f"[WRITTEN] {device_id} | actual_capacity: {dev_actual_cap:.4f}Ah | soh: {new_soh:.6f} | version: {final_version}")
 
     print(f"\n[DONE] detect_and_estimate_capacity complete | Events saved: {events_saved}")
     return events_saved
@@ -387,7 +432,7 @@ def main():
     for i in range(NUM_DAYS):
         date_str = (start_date + timedelta(days=i)).strftime("%Y-%m-%d")
         print(f"\n--- Day {i + 1}: {date_str} ---")
-        run_dbt_command(["run", "--select", "stg_battery_raw_parquet_data", "inter_battery_variable_mapping", "--vars", f'{{"process_date": "{date_str}"}}'])
+        run_dbt_command(["run", "--select", "stg_battery_raw_parquet_data inter_battery_variable_mapping", "--vars", f'{{"process_date": "{date_str}"}}'])
 
     con = duckdb.connect(db_path)
 
@@ -419,30 +464,33 @@ def main():
         )
     """)
 
-    con.execute("""
-        INSERT INTO ocv_table VALUES
-            (0,   2.973),
-            (5,   3.183),
-            (10,  3.202),
-            (15,  3.222),
-            (20,  3.246),
-            (25,  3.262),
-            (30,  3.278),
-            (35,  3.284),
-            (40,  3.285),
-            (45,  3.285),
-            (50,  3.288),
-            (55,  3.289),
-            (60,  3.291),
-            (65,  3.312),
-            (70,  3.325),
-            (75,  3.326),
-            (80,  3.326),
-            (85,  3.326),
-            (90,  3.327),
-            (95,  3.329),
-            (100, 3.339)
-    """)
+    count = con.execute("SELECT COUNT(*) FROM ocv_table").fetchone()[0]
+    
+    if count == 0:
+        con.execute("""
+            INSERT INTO ocv_table VALUES
+                (0,   2.973),
+                (5,   3.183),
+                (10,  3.202),
+                (15,  3.222),
+                (20,  3.246),
+                (25,  3.262),
+                (30,  3.278),
+                (35,  3.284),
+                (40,  3.285),
+                (45,  3.285),
+                (50,  3.288),
+                (55,  3.289),
+                (60,  3.291),
+                (65,  3.312),
+                (70,  3.325),
+                (75,  3.326),
+                (80,  3.326),
+                (85,  3.326),
+                (90,  3.327),
+                (95,  3.329),
+                (100, 3.339)
+        """)
     
     try:
         ocv_voltages, ocv_socs = load_ocv_table(con)

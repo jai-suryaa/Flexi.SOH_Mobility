@@ -47,16 +47,27 @@ WITH source_data AS (
         ((TRY_CAST(Temp8 AS DOUBLE) + TRY_CAST(Temp9 AS DOUBLE)) / 2.0) AS temp14,
         TRY_CAST(Temp8  AS DOUBLE) AS temp15,
         TRY_CAST(Temp14 AS DOUBLE) AS temp16
+
     FROM {{ ref('stg_battery_raw_parquet_data') }}
-    INNER JOIN device_pack_mapping AS m
-        ON batteryId = m.unique_id
+    WHERE batteryId IN ('2233786558040370260', '4107284003026496596', '1585268215994051668')
+),
+
+with_avg_temp AS (
+    SELECT *,
+        list_avg([
+            temp01, temp02, temp03, temp04,
+            temp05, temp06, temp07, temp08,
+            temp09, temp10, temp11, temp12,
+            temp13, temp14, temp15, temp16
+        ]) AS avg_temp
+    FROM source_data
 ),
 
 time_diff AS (
     SELECT
         *,
         EXTRACT(EPOCH FROM (ts - LAG(ts, 1, ts) OVER (PARTITION BY device_id ORDER BY ts))) AS delta_t_seconds
-    FROM source_data
+    FROM with_avg_temp
 ),
 
 q_calc AS (
@@ -69,7 +80,10 @@ q_calc AS (
 q_throughput_calc AS (
     SELECT
         *,
-        TRY_CAST(SUM(q_delta) OVER (PARTITION BY device_id, DATE_TRUNC('day', ts) ORDER BY ts) AS DOUBLE) AS q_throughput
+        TRY_CAST(SUM(q_delta) OVER (
+            PARTITION BY device_id, DATE_TRUNC('day', ts)
+            ORDER BY ts
+        ) AS DOUBLE) AS q_throughput
     FROM q_calc
 )
 
@@ -84,6 +98,7 @@ SELECT
     v_max,
     v1, v2, v3, v4, v5, v6, v7, v8,
     v9, v10, v11, v12, v13, v14, v15, v16,
+
     ROUND(temp01, 2) AS temp01,
     ROUND(temp02, 2) AS temp02,
     ROUND(temp03, 2) AS temp03,
@@ -100,9 +115,14 @@ SELECT
     ROUND(temp14, 2) AS temp14,
     ROUND(temp15, 2) AS temp15,
     ROUND(temp16, 2) AS temp16,
+
+    ROUND(avg_temp, 2) AS avg_temp,
+
     TRY_CAST(q_delta      AS DOUBLE) AS q_delta,
     TRY_CAST(q_throughput AS DOUBLE) AS q_throughput
+
 FROM q_throughput_calc
+
 WHERE
     device_id IS NOT NULL
     AND ts IS NOT NULL
