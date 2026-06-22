@@ -1,5 +1,7 @@
 {{ config(
     materialized='incremental',
+    incremental_strategy='merge',
+    unique_key=['device_id','ts'],
     tags=['experimental', 'SOH']
 ) }}
 
@@ -49,7 +51,6 @@ WITH source_data AS (
         TRY_CAST(Temp14 AS DOUBLE) AS temp16
 
     FROM {{ ref('stg_battery_raw_parquet_data') }}
-    WHERE batteryId IN ('2233786558040370260', '4107284003026496596', '1585268215994051668')
 ),
 
 with_avg_temp AS (
@@ -118,7 +119,7 @@ SELECT
 
     ROUND(avg_temp, 2) AS avg_temp,
 
-    TRY_CAST(q_delta      AS DOUBLE) AS q_delta,
+    TRY_CAST(q_delta AS DOUBLE) AS q_delta,
     TRY_CAST(q_throughput AS DOUBLE) AS q_throughput
 
 FROM q_throughput_calc
@@ -130,7 +131,3 @@ WHERE
     AND soc IS NOT NULL
     AND q_delta IS NOT NULL
     AND q_throughput IS NOT NULL
-
-{% if is_incremental() %}
-    AND ts > (SELECT MAX(ts) FROM {{ this }})
-{% endif %}

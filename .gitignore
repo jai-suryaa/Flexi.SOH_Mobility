@@ -32,6 +32,7 @@ MANIFEST
 
 # Logs folder
 logs/
+CSVs/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

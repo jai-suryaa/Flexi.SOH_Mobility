@@ -6,9 +6,50 @@ import pandas as pd
 import os
 import traceback
 import sys
+import gc
+import resource
+import shutil
+import time
+import boto3
+import json
+
+TARGET_IDS = [
+    "2089671369964514388",
+    "2161728964002442324",
+    "2233786558040370260",
+    "2305844152078298196",
+    "2377901746116226132",
+    "2449959340154154068",
+    "2522016934192082004",
+    "2594074528230009940",
+    "2666132122267937876",
+    "2738189716305865812",
+    "2810247310343793748",
+    "4107284003026496596",
+    "4107284003026496596",
+    "3026420092457577556",
+    "3098477686495505492",
+    "3170535280533433428",
+    "3242592874571361364",
+    "3314650468609289300",
+    "3386708062647217236",
+    "3458765656685145172",
+    "3530823250723073108",
+    "3602880844761001044",
+    "3674938438798928980",
+    "3746996032836856916",
+    "3819053626874784852",
+    "3891111220912712788",
+    "11168928218743434324",
+    "4035226408988568660",
+    "11313043406819290196",
+    "72058741197565012",
+]
+
+s3 = boto3.client("s3")
 
 NUM_DAYS = 15
-DBT_PROJECT_DIR = "C:/EOL/SOH/Flexi.SOH_Mobility"
+DBT_PROJECT_DIR = "/home/tec-ubuntu/Jai-Codes/Flexi.SOH_Mobility"
 DB_FILE = "dev.duckdb"
 
 SOC_START_THRESHOLD   = 30.0
@@ -24,6 +65,49 @@ IMBALANCE_TABLE_MV = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110]
 IMBALANCE_TABLE_AH = [0, 0.18, 0.32, 0.46, 0.56, 0.66, 0.80, 1.02, 1.34, 1.84, 2.60, 3.68]
 VREF_IMBALANCE     = 3.58
 SOH_INITIAL        = 1.0
+
+def get_parquet_paths(process_date):
+
+    year, month, day = process_date.split("-")
+
+    prefix = (
+        f"Year={int(year)}/"
+        f"Month={int(month)}/"
+        f"Day={int(day)}/"
+    )
+
+    existing_ids = set()
+
+    paginator = s3.get_paginator("list_objects_v2")
+
+    for page in paginator.paginate(
+        Bucket="tec-raw-data-archive",
+        Prefix=prefix,
+        Delimiter="/"
+    ):
+        for cp in page.get("CommonPrefixes", []):
+            uid = cp["Prefix"].split("uniqueId=")[-1].rstrip("/")
+            existing_ids.add(uid)
+
+    matched_ids = [
+        uid
+        for uid in TARGET_IDS
+        if uid in existing_ids
+    ]
+
+    paths = [
+        f"s3://tec-raw-data-archive/"
+        f"{prefix}"
+        f"uniqueId={uid}/*.parquet"
+        for uid in matched_ids
+    ]
+    print(
+        f"\n[S3] Found {len(existing_ids)} partitions, "
+        f"{len(matched_ids)} target packs fetched\n",
+        flush=True
+    )
+
+    return paths
 
 def _get_current_version(con, device_id):
     result = con.execute("""
@@ -406,33 +490,102 @@ def detect_and_estimate_capacity(con, start_date, end_date, ocv_voltages, ocv_so
     return events_saved
 
 def run_dbt_command(command_args):
-    try:
+    cmd = (
+        ["dbt"]
+        + command_args[:1]
+        + ["--no-partial-parse", "--no-write-json"]
+        + command_args[1:]
+    )
+
+    for attempt in range(2):
+
         result = subprocess.run(
-            ["dbt"] + command_args,
+            cmd,
             cwd=DBT_PROJECT_DIR,
-            text=True,
-            capture_output=True,
-            shell=False,
-            encoding="utf-8"
+            shell=False
         )
-        print(result.stdout)
-        print(result.stderr)
-        if result.returncode != 0:
-            raise Exception("dbt failed")
-    except Exception as e:
-        print(f"Error running dbt: {' '.join(command_args)}\n{e}")
-        exit(1)
 
+        if result.returncode == 0:
+            return
 
+        print(f"RETURN CODE: {result.returncode}")
+
+        if result.returncode == -11:
+
+            if attempt == 0:
+
+                print("Segmentation fault detected. Retrying once...")
+
+                shutil.rmtree(
+                    os.path.join(DBT_PROJECT_DIR, "target"),
+                    ignore_errors=True
+                )
+
+                for root, dirs, files in os.walk(DBT_PROJECT_DIR):
+                    for file in files:
+                        if file == "partial_parse.msgpack":
+                            try:
+                                os.remove(
+                                    os.path.join(root, file)
+                                )
+                            except Exception:
+                                pass
+
+                gc.collect()
+                time.sleep(5)
+
+                continue
+
+            raise RuntimeError("dbt segfaulted twice")
+
+        raise RuntimeError(
+            f"dbt failed with return code {result.returncode}"
+        )
+        
 def main():
     start_date = parse_args()
     end_date = start_date + timedelta(days=NUM_DAYS)
-    db_path  = os.path.join(DBT_PROJECT_DIR, DB_FILE)
+    db_path = os.path.join(DBT_PROJECT_DIR, DB_FILE)
+
+    con = duckdb.connect(db_path)
+
+    con.execute("""
+    DROP TABLE IF EXISTS inter_battery_variable_mapping
+    """)
+
+    con.close()
 
     for i in range(NUM_DAYS):
         date_str = (start_date + timedelta(days=i)).strftime("%Y-%m-%d")
+
         print(f"\n--- Day {i + 1}: {date_str} ---")
-        run_dbt_command(["run", "--select", "stg_battery_raw_parquet_data inter_battery_variable_mapping", "--vars", f'{{"process_date": "{date_str}"}}'])
+
+        try:
+
+            parquet_paths = get_parquet_paths(date_str)
+
+            if not parquet_paths:
+                print(f"No matching packs found for {date_str}")
+                continue
+
+            dbt_vars = {
+                "parquet_paths": parquet_paths
+            }
+
+            run_dbt_command(
+                [
+                    "run",
+                    "--select",
+                    "stg_battery_raw_parquet_data inter_battery_variable_mapping",
+                    "--vars",
+                    json.dumps(dbt_vars)
+                ]
+            )
+
+        except Exception as e:
+
+            print(f"Skipping {date_str}: {e}")
+            continue
 
     con = duckdb.connect(db_path)
 
@@ -464,8 +617,10 @@ def main():
         )
     """)
 
-    count = con.execute("SELECT COUNT(*) FROM ocv_table").fetchone()[0]
-    
+    count = con.execute(
+        "SELECT COUNT(*) FROM ocv_table"
+    ).fetchone()[0]
+
     if count == 0:
         con.execute("""
             INSERT INTO ocv_table VALUES
@@ -491,20 +646,30 @@ def main():
                 (95,  3.329),
                 (100, 3.339)
         """)
-    
+
     try:
         ocv_voltages, ocv_socs = load_ocv_table(con)
-        events = detect_and_estimate_capacity(con, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"), ocv_voltages, ocv_socs)
+        print(f"[CHECK] Devices in table: {con.execute('SELECT DISTINCT device_id FROM inter_battery_variable_mapping').fetchall()}")
+
+        events = detect_and_estimate_capacity(
+            con,
+            start_date.strftime("%Y-%m-%d"),
+            end_date.strftime("%Y-%m-%d"),
+            ocv_voltages,
+            ocv_socs
+        )
+
         if events == 0:
             print("No charge events detected.")
+
     except BaseException as e:
         print(f"Error: {type(e).__name__}: {e}")
         traceback.print_exc()
+
     finally:
         con.close()
 
     print("\nDone.")
-
 
 if __name__ == "__main__":
     main()
