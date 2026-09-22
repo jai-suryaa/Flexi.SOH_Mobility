@@ -4,7 +4,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-start = datetime(2026, 2, 27)
+start = datetime(2024, 10, 5)
 today = datetime.today()
 WINDOW_DAYS = 15
 
