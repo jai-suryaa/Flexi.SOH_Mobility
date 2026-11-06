@@ -74,7 +74,14 @@ time_diff AS (
 q_calc AS (
     SELECT
         *,
-        TRY_CAST(ABS(current) * (delta_t_seconds / 3600.0) AS DOUBLE) AS q_delta
+        CASE
+            WHEN delta_t_seconds <= 30
+            THEN TRY_CAST(
+                ABS(current) * (delta_t_seconds / 3600.0)
+                AS DOUBLE
+            )
+            ELSE 0.0
+        END AS q_delta
     FROM time_diff
 ),
 
